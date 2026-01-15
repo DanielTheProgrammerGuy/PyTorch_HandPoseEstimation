@@ -1,0 +1,18 @@
+# Data files (DON'T upload 32K images to GitHub)
+Training_Data.npz
+data/
+*.npz
+
+# Model files (keep checkpoints local)
+models/
+*.pth
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+
+# System
+.DS_Store
+
+DATASETS/
