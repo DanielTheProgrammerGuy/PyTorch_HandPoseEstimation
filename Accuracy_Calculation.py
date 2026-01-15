@@ -1,5 +1,4 @@
 from Training import UNet2DHandPose
-import matplotlib.pyplot as plt
 from skimage.feature import peak_local_max
 import numpy as np
 import torch
