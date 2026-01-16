@@ -1,110 +1,41 @@
+"""
+Training script for Hand Pose Estimation U-Net model
+Uses Adaptive Winged Loss and mixed precision training
+"""
+import os
+import time
+from datetime import datetime
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from torch.utils.data import DataLoader, Dataset
-import torchvision.transforms.v2 as v2
 from torch.amp import GradScaler, autocast
 from torch.optim import lr_scheduler
+import torchvision.transforms.v2 as v2
 import torchvision.transforms.v2.functional as Fv2
-import time
-import random
-import matplotlib.pyplot as plt
+
+import numpy as np
 import cv2
-from datetime import datetime
-import os
+import matplotlib.pyplot as plt
+
 from Config import config
 
+# Enable cuDNN benchmarking for faster training
 torch.backends.cudnn.benchmark = True
-if __name__ == "__main__":
-    from Data_Extraction import data
-    NUM_EPOCHS = config["epochs"]
-    BATCH_SIZE = config["batch size"]
-    start_run = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-
-def apply_color_jitter_to_image(img, heatmap):
-    # Define the color jitter transform here
-    color_jitter = v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.1)
-    # Apply to image, return original heatmap
-    return color_jitter(img), heatmap
-
-
-def apply_transforms_to_both(img, heatmap):
-    # Define affine ranges
-    degrees = 25
-    translate = (0.15, 0.15)
-    scale_ranges = (0.8, 1.2)
-    shears = None
-    flip = random.random() < 0.5
-    blur = random.random() < 0.5
-    perspective_warp = random.random() < 0
-    distortion = 0.7
-
-    # Sample random affine parameters
-    angle, translations, scale, shear = v2.RandomAffine.get_params(
-        degrees=(-degrees, degrees),
-        translate=translate,
-        scale_ranges=scale_ranges,
-        shears=shears,
-        img_size=img.shape[1:]  # (H, W)
-    )
-
-    # Apply SAME affine transform
-    img = Fv2.affine(
-        img,
-        angle=angle,
-        translate=translations,
-        scale=scale,
-        shear=shear,
-        interpolation=v2.InterpolationMode.BILINEAR,
-        fill=0)
-
-    heatmap = Fv2.affine(
-        heatmap,
-        angle=angle,
-        translate=translations,
-        scale=scale,
-        shear=shear,
-        interpolation=v2.InterpolationMode.NEAREST,
-        fill=0)
-    
-    
-    if flip:
-        img = Fv2.hflip(img)
-        heatmap = Fv2.hflip(heatmap)
-    if blur:
-        img_np = img.permute(1, 2, 0).numpy()
-        img_np = cv2.GaussianBlur(img_np, (5, 5), 0)
-        img = torch.from_numpy(img_np).permute(2, 0, 1)
-    if perspective_warp:
-        pts1 = np.float32([[0, 0], [1, 0], [1, 1], [0, 1]])
-        pts2 = pts1 + np.random.uniform(-distortion, distortion, pts1.shape).astype(np.float32)
-
-        h, w = img.shape[1:]
-        pts1 *= [w, h]
-        pts2 *= [w, h]
-
-        M = cv2.getPerspectiveTransform(pts1, pts2)
-
-        img_np = img.permute(1, 2, 0).numpy()
-        heat_np = heatmap.squeeze(0).permute(1, 2, 0).numpy()
-        img_np = cv2.warpPerspective(img_np, M, (w, h))
-        heat_np = cv2.warpPerspective(heat_np, M, (w, h))
-        img = torch.from_numpy(img_np).permute(2, 0, 1)
-        heatmap = torch.from_numpy(heat_np).permute(2, 0, 1)
-
-    return img, heatmap
 
 
 class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    """Double convolution block with BatchNorm and ReLU"""
+    
+    def __init__(self, in_channels, out_channels):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_ch),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
         )
 
@@ -113,9 +44,20 @@ class ConvBlock(nn.Module):
 
 
 class UNet2DHandPose(nn.Module):
-    def __init__(self, init_ch=config["Unet Channels"]):
+    """
+    U-Net architecture for hand pose estimation
+    
+    Args:
+        init_channels: Number of channels in first conv block
+    """
+    
+    def __init__(self, init_channels=None):
         super().__init__()
-        N = init_ch
+        if init_channels is None:
+            init_channels = config["unet_channels"]
+        
+        N = init_channels
+        
         # Encoder
         self.conv1 = ConvBlock(3, N)
         self.conv2 = ConvBlock(N, 2 * N)
@@ -124,252 +66,468 @@ class UNet2DHandPose(nn.Module):
         self.pool = nn.MaxPool2d(2)
 
         # Decoder
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear')
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear')
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear')
-        self.conv5 = ConvBlock(8 * N + 4 * N, 4 * N)
-        self.conv6 = ConvBlock(4 * N + 2 * N, 2 * N)
-        self.conv7 = ConvBlock(2 * N + N, N)
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        
+        self.conv5 = ConvBlock(12 * N, 4 * N)  # 8N + 4N
+        self.conv6 = ConvBlock(6 * N, 2 * N)   # 4N + 2N
+        self.conv7 = ConvBlock(3 * N, N)       # 2N + N
 
-        # Final head
+        # Final output layer
         self.final = nn.Sequential(
             nn.Conv2d(N, 21, kernel_size=1),
-            nn.Sigmoid())
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        # Encoder
-        x1 = self.conv1(x) #                3 x 128 x 128       ->      N x 128 x 128
-        x2 = self.conv2(self.pool(x1)) #    N x 128 x 128       ->      2N x 64 x 64
-        x3 = self.conv3(self.pool(x2)) #    2N x 64 x 64        ->      4N x 32 x 32
-        x4 = self.conv4(self.pool(x3)) #    4N x 32 x 32        ->      8N x 16 x 16
+        """
+        Forward pass
+        
+        Args:
+            x: Input images [B, 3, H, W]
+            
+        Returns:
+            Heatmaps [B, 21, H, W]
+        """
+        # Encoder path
+        x1 = self.conv1(x)              # N x 128 x 128
+        x2 = self.conv2(self.pool(x1))  # 2N x 64 x 64
+        x3 = self.conv3(self.pool(x2))  # 4N x 32 x 32
+        x4 = self.conv4(self.pool(x3))  # 8N x 16 x 16
 
-        # Decoder
-        u1 = self.up1(x4) #                  8N x 16 x 16        ->      8N x 32 x 32
-        u1 = torch.cat([u1, x3], dim=1) #   8N+4N x 32 x 32     ->      12N x 32 x 32
-        u1 = self.conv5(u1)#                12N x 32 x 32       ->      4N x 32 x 32
-        u2 = self.up2(u1) #                  4N x 32 x 32        ->      4N x 64 x 64
-        u2 = torch.cat([u2, x2], dim=1)#    4N+2N x 64 x 64     ->      6N x 64 x 64
-        u2 = self.conv6(u2)#                6N x 64 x 64        ->      2N x 64 x 64
-        u3 = self.up3(u2)#                   2N x 64 x 64        ->      2N x 128 x 128
-        u3 = torch.cat([u3, x1], dim=1)#    2N+1N x 128 x 128   ->      3N x 128 x 128
-        u3 = self.conv7(u3)#                3N x 128 x 128      ->      1N x 128 x 128
+        # Decoder path with skip connections
+        u1 = self.up1(x4)                    # 8N x 32 x 32
+        u1 = torch.cat([u1, x3], dim=1)      # 12N x 32 x 32
+        u1 = self.conv5(u1)                  # 4N x 32 x 32
+        
+        u2 = self.up2(u1)                    # 4N x 64 x 64
+        u2 = torch.cat([u2, x2], dim=1)      # 6N x 64 x 64
+        u2 = self.conv6(u2)                  # 2N x 64 x 64
+        
+        u3 = self.up3(u2)                    # 2N x 128 x 128
+        u3 = torch.cat([u3, x1], dim=1)      # 3N x 128 x 128
+        u3 = self.conv7(u3)                  # N x 128 x 128
 
-        # currently N x 128 x 128 -> 21 x 128 x 128
-        out = self.final(u3)
+        # Output heatmaps
+        out = self.final(u3)                 # 21 x 128 x 128
         out = out.clamp(min=0)
-        out = F.interpolate(out, scale_factor=config["heatmap size"]/config["image size"], mode="bilinear", align_corners=False)
+        
+        # Resize if heatmap size differs from image size
+        if config["heatmap_size"] != config["image_size"]:
+            scale = config["heatmap_size"] / config["image_size"]
+            out = F.interpolate(
+                out, 
+                scale_factor=scale, 
+                mode="bilinear", 
+                align_corners=False
+            )
+        
         return out
 
 
-class AugmentedTensorDataset(Dataset):
-    def __init__(self, data_tensor, target_tensor, transform=None):
-        self.data = data_tensor
-        self.targets = target_tensor
-        self.transform = transform
-
-    def __getitem__(self, index):
-        img = self.data[index]
-        heatmap = self.targets[index]
-
-        if self.transform:
-            img, heatmap = self.transform(img, heatmap)
-
-        return img, heatmap
-
-    def __len__(self):
-        return len(self.data)
-    
-def collate_fn(batch):
-  return {
-      'pixel_values': torch.stack([x['pixel_values'] for x in batch]),
-      'labels': torch.tensor([x['labels'] for x in batch])
-}
-
 class AdaptiveWingLoss(nn.Module):
+    """
+    Adaptive Wing Loss for heatmap regression
+    
+    More robust than MSE for keypoint localization
+    Reference: Wang et al. "Adaptive Wing Loss for Robust Face Alignment via Heatmap Regression"
+    
+    Args:
+        omega: Overall loss scale
+        theta: Threshold between log and linear regions
+        epsilon: Smoothing parameter
+        alpha: Adaptivity parameter
+    """
+    
     def __init__(self, omega=14, theta=0.5, epsilon=1, alpha=2.1):
-        super(AdaptiveWingLoss, self).__init__()
+        super().__init__()
         self.omega = omega
         self.theta = theta
         self.epsilon = epsilon
         self.alpha = alpha
 
     def forward(self, pred, target):
-        y = target
-        y_hat = pred
-        delta_y = (y - y_hat).abs()
-
-        # Logarithmic part for small errors
-        # (self.alpha - y) makes it adaptive to the heatmap ground truth
-        A = self.omega * (1 / (1 + torch.pow(self.theta / self.epsilon, self.alpha - y))) * (self.alpha - y) * (torch.pow(self.theta / self.epsilon, self.alpha - y - 1)) * (1 / self.epsilon)
-        C = self.theta * A - self.omega * torch.log(1 + torch.pow(self.theta / self.epsilon, self.alpha - y))
+        """
+        Calculate Adaptive Wing Loss
         
-        losses = torch.where(
-            delta_y < self.theta,
-            self.omega * torch.log(1 + torch.pow(delta_y / self.epsilon, self.alpha - y)),
-            A * delta_y - C
+        Args:
+            pred: Predicted heatmaps
+            target: Ground truth heatmaps
+            
+        Returns:
+            Loss value
+        """
+        delta = torch.abs(pred - target)
+        
+        # Adaptive parameters based on ground truth
+        A = self.omega * (
+            1 / (1 + torch.pow(self.theta / self.epsilon, self.alpha - target))
+        ) * (self.alpha - target) * (
+            torch.pow(self.theta / self.epsilon, self.alpha - target - 1)
+        ) * (1 / self.epsilon)
+        
+        C = (
+            self.theta * A 
+            - self.omega * torch.log(
+                1 + torch.pow(self.theta / self.epsilon, self.alpha - target)
+            )
         )
-        return losses.mean()
+        
+        # Piecewise loss: logarithmic for small errors, linear for large
+        loss = torch.where(
+            delta < self.theta,
+            self.omega * torch.log(
+                1 + torch.pow(delta / self.epsilon, self.alpha - target)
+            ),
+            A * delta - C
+        )
+        
+        return loss.mean()
+
+
+class AugmentedDataset(Dataset):
+    """
+    Dataset with on-the-fly data augmentation
+    
+    Args:
+        images: Image tensor [N, 3, H, W]
+        heatmaps: Heatmap tensor [N, 21, H, W]
+        transform: Optional transform function
+    """
+    
+    def __init__(self, images, heatmaps, transform=None):
+        self.images = images
+        self.heatmaps = heatmaps
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img = self.images[idx]
+        heatmap = self.heatmaps[idx]
+
+        if self.transform:
+            img, heatmap = self.transform(img, heatmap)
+
+        return img, heatmap
+
+
+def apply_geometric_transforms(img, heatmap):
+    """
+    Apply random geometric transformations to both image and heatmap
+    
+    Args:
+        img: Image tensor [3, H, W]
+        heatmap: Heatmap tensor [21, H, W]
+        
+    Returns:
+        Transformed (image, heatmap)
+    """
+    import random
+    
+    # Random affine parameters
+    angle, translations, scale, shear = v2.RandomAffine.get_params(
+        degrees=(-25, 25),
+        translate=(0.15, 0.15),
+        scale_ranges=(0.8, 1.2),
+        shears=None,
+        img_size=img.shape[1:]
+    )
+
+    # Apply same transform to both
+    img = Fv2.affine(
+        img, angle, translations, scale, shear,
+        interpolation=v2.InterpolationMode.BILINEAR,
+        fill=0
+    )
+    heatmap = Fv2.affine(
+        heatmap, angle, translations, scale, shear,
+        interpolation=v2.InterpolationMode.NEAREST,
+        fill=0
+    )
+    
+    # Random horizontal flip
+    if random.random() < 0.5:
+        img = Fv2.hflip(img)
+        heatmap = Fv2.hflip(heatmap)
+    
+    # Random Gaussian blur (image only)
+    if random.random() < 0.5:
+        img_np = img.permute(1, 2, 0).numpy()
+        img_np = cv2.GaussianBlur(img_np, (5, 5), 0)
+        img = torch.from_numpy(img_np).permute(2, 0, 1)
+
+    return img, heatmap
+
+
+def apply_color_jitter(img, heatmap):
+    """
+    Apply color jittering to image only
+    
+    Args:
+        img: Image tensor
+        heatmap: Heatmap tensor (unchanged)
+        
+    Returns:
+        (jittered_img, heatmap)
+    """
+    color_jitter = v2.ColorJitter(
+        brightness=0.4,
+        contrast=0.4,
+        saturation=0.3,
+        hue=0.1
+    )
+    return color_jitter(img), heatmap
+
+
+def train_epoch(model, loader, criterion, optimizer, scaler, device, use_amp):
+    """
+    Train for one epoch
+    
+    Returns:
+        Average training loss
+    """
+    model.train()
+    total_loss = 0.0
+    
+    for batch_idx, (images, heatmaps) in enumerate(loader):
+        images = images.to(device, non_blocking=True)
+        heatmaps = heatmaps.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        # Mixed precision forward pass
+        with autocast(device_type='cuda', enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, heatmaps)
+
+        # Backward pass with gradient scaling
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+def validate(model, loader, criterion, device):
+    """
+    Validate model
+    
+    Returns:
+        Average validation loss
+    """
+    model.eval()
+    total_loss = 0.0
+    
+    with torch.no_grad():
+        for images, heatmaps in loader:
+            images = images.to(device, non_blocking=True)
+            heatmaps = heatmaps.to(device, non_blocking=True)
+            
+            outputs = model(images)
+            loss = criterion(outputs, heatmaps)
+            total_loss += loss.item()
+    
+    return total_loss / len(loader)
+
+
+def save_training_curve(train_losses, val_losses, save_path):
+    """Save training/validation loss curve"""
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label="Training Loss", linewidth=2)
+    plt.plot(val_losses, label="Validation Loss", linewidth=2)
+    plt.xlabel("Epoch", fontsize=12)
+    plt.ylabel("Loss", fontsize=12)
+    plt.title("Training Progress", fontsize=14)
+    plt.legend(fontsize=11)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close()
+
 
 def main():
-    # Ask to load last model
-    load_last_model = input("Load Model? (y/n): ") == "y"
-    if load_last_model:
-        for i in range(len(os.listdir("models/"))):
-            print(f"{i}. {os.listdir('models/')[i]}")
-        model_name = os.listdir('models/')[int(input("Enter model index: "))]
-    torch_heatmaps = torch.from_numpy(data["heatmaps"])
-    torch_img = torch.from_numpy(data["data"]).permute(0, 3, 1, 2)
-    print("Converted to Torch and Normalized")
-    train_heatmaps = torch_heatmaps[:30000]
-    train_data = torch_img[:30000]
-    print("Train Data Extracted")
-    test_heatmaps = torch_heatmaps[30000:]
-    test_data = torch_img[30000:]
-    print("Val Data Extracted")
-
-    print(
-        f"\rData Loaded  Heatmaps:[{data['heatmaps'].nbytes / 1000000000:.3f}GB] Images:[{data['data'].nbytes / 1000000000:.3f}GB]")
-
-    '''
-    i = 0
-    while True:
-        show_pair("title",test_data[i],test_heatmaps[i])
-        i += 1
-        '''
-
-    # Setup device and AMP scaler
+    """Main training loop"""
+    print("=" * 70)
+    print(" " * 20 + "Hand Pose Estimation Training")
+    print("=" * 70)
+    
+    # Load or resume model
+    load_checkpoint = input("\nLoad existing model? (y/n): ").lower() == 'y'
+    checkpoint_path = None
+    
+    if load_checkpoint:
+        models_dir = config["model_save_dir"]
+        models = os.listdir(models_dir)
+        
+        if len(models) == 0:
+            print("No models found. Training from scratch.")
+            load_checkpoint = False
+        else:
+            print("\nAvailable models:")
+            for i, model_name in enumerate(models):
+                print(f"  {i}. {model_name}")
+            
+            idx = int(input("Enter model index: "))
+            checkpoint_path = os.path.join(models_dir, models[idx])
+    
+    # Load data
+    print("\nLoading dataset...")
+    from Data_Extraction import data
+    
+    heatmaps = torch.from_numpy(data["heatmaps"])
+    images = torch.from_numpy(data["data"]).permute(0, 3, 1, 2)
+    
+    # Train/validation split
+    train_images = images[:30000]
+    train_heatmaps = heatmaps[:30000]
+    val_images = images[30000:]
+    val_heatmaps = heatmaps[30000:]
+    
+    print(f"Training samples: {len(train_images)}")
+    print(f"Validation samples: {len(val_images)}")
+    
+    # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    scaler = GradScaler()
     use_amp = torch.cuda.is_available()
-    print(f"Using the device: {device}")
-
+    print(f"\nDevice: {device}")
+    print(f"Mixed Precision: {use_amp}")
+    
+    # Data augmentation
     train_transforms = v2.Compose([
-        apply_transforms_to_both,
-        apply_color_jitter_to_image
+        apply_geometric_transforms,
+        apply_color_jitter
     ])
-
-    val_transforms = None  # Already preprocessed to 0-1 range
-
-    train_dataset = AugmentedTensorDataset(train_data, train_heatmaps, transform=train_transforms)
-    val_dataset = AugmentedTensorDataset(test_data, test_heatmaps, transform=val_transforms)
-
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, prefetch_factor=2,
-                              pin_memory=True, persistent_workers=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
-
+    
+    # Create datasets
+    train_dataset = AugmentedDataset(train_images, train_heatmaps, train_transforms)
+    val_dataset = AugmentedDataset(val_images, val_heatmaps, transform=None)
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    # Initialize model
     model = UNet2DHandPose().to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Model Params:", total_params)
-    if load_last_model:
-        model.load_state_dict(torch.load(f"models/{model_name}"))
+    print(f"Model parameters: {total_params:,}")
+    
+    # Load checkpoint if specified
+    if load_checkpoint and checkpoint_path:
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        print(f"Loaded checkpoint: {checkpoint_path}")
+    
+    # Setup training
     criterion = AdaptiveWingLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning rate"])
-    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=4)
-    early_stop_epochs = 10
-    epochs_since_improvement = 0
-    best_val_loss = None
-
-    '''
-    ###
-    ### TESTING
-    ###
-    start = time.time()
-    for i, (img, heat) in enumerate(train_loader):
-        if i == 100: break
-    print("100 batches time:", time.time() - start)
-
-    dummy_img = torch.randn(32, 3, 64, 64).cuda()
-    dummy_heat = torch.randn(32, 21, 64, 64).cuda()
-
-    start = time.time()
-    for _ in range(200):
-        out = model(dummy_img)
-    torch.cuda.synchronize()
-    print("GPU only time:", time.time() - start)
-
-    ###
-    ###
-    ###
-    '''
-
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config["learning_rate"]
+    )
+    scheduler = lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
+        factor=0.1,
+        patience=4,
+        verbose=True
+    )
+    scaler = GradScaler()
+    
+    # Training parameters
+    num_epochs = config["epochs"]
+    early_stop_patience = 10
+    best_val_loss = float('inf')
+    epochs_without_improvement = 0
+    
     train_losses = []
-    test_losses = []
-
-    for epoch in range(NUM_EPOCHS):
-        model.train()
-        running_loss = 0.0
-        print(f"Epoch {epoch + 1}/{NUM_EPOCHS}: ", end="")
+    val_losses = []
+    
+    # Create save directory
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+    model_path = os.path.join(config["model_save_dir"], f"model-{timestamp}.pth")
+    curve_path = f"training_curves/curve-{timestamp}.png"
+    
+    os.makedirs("training_curves", exist_ok=True)
+    os.makedirs(config["model_save_dir"], exist_ok=True)
+    
+    print("\n" + "=" * 70)
+    print("Starting training...")
+    print("=" * 70)
+    
+    # Training loop
+    for epoch in range(num_epochs):
         start_time = time.time()
-        for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            with autocast(device_type='cuda', enabled=use_amp):
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            running_loss += loss.item()
-
-            bar_length = 50
-            print(
-                f"\rEpoch {(epoch + 1):>3}/{NUM_EPOCHS} | Epoch Runtime: {time.time() - start_time:>7.3f}s | Loss = {running_loss / (batch_idx + 1):.8f} | Progress[\033[34m{int(batch_idx / (len(train_loader) - 1) * bar_length) * '█'}\033[90m{(bar_length - int(batch_idx / (len(train_loader) - 1) * bar_length)) * '█'}\033[0m]{batch_idx + 1}/{len(train_loader)}",
-                end="")
-
-        epoch_train_loss = running_loss / (batch_idx + 1)
-        print(f"\rEpoch {(epoch + 1):>3}/{NUM_EPOCHS} | Epoch Runtime: {time.time() - start_time:>7.3f}s | Loss = {epoch_train_loss:.8f}",end="")
-        train_losses.append(epoch_train_loss)
-
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
-
-                outputs = model(inputs)
-                val_loss += criterion(outputs, targets).item()
-        avg_val_loss = val_loss / len(val_loader)
-        print(f" | Val_Loss = {avg_val_loss:.8f}{' '*bar_length}")
-        scheduler.step(avg_val_loss)
-        test_losses.append(avg_val_loss)
-
-        if best_val_loss == None or avg_val_loss < best_val_loss:
-            epochs_since_improvement = 0
-            torch.save(model.state_dict(), f"models/model-{start_run}.pth")
-            best_val_loss = avg_val_loss
+        
+        # Train
+        train_loss = train_epoch(
+            model, train_loader, criterion, optimizer,
+            scaler, device, use_amp
+        )
+        
+        # Validate
+        val_loss = validate(model, val_loader, criterion, device)
+        
+        # Update scheduler
+        scheduler.step(val_loss)
+        
+        # Record losses
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        
+        # Print progress
+        epoch_time = time.time() - start_time
+        print(
+            f"Epoch {epoch+1:3d}/{num_epochs} | "
+            f"Time: {epoch_time:6.2f}s | "
+            f"Train Loss: {train_loss:.6f} | "
+            f"Val Loss: {val_loss:.6f}"
+        )
+        
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), model_path)
+            print(f"  → Saved best model (val_loss: {val_loss:.6f})")
         else:
-            epochs_since_improvement += 1
-            if epochs_since_improvement > early_stop_epochs or epoch == NUM_EPOCHS - 1:
-                print("Stopped imporiving, ending early!")
-                torch.save(model.state_dict(), f"models/model-{start_run}.pth")
-                plt.figure(figsize=(8, 5))
-                plt.plot(train_losses[1:], label="Train Loss")
-                plt.plot(test_losses[1:], label="Test Loss")
-                plt.xlabel("Epoch")
-                plt.ylabel("Loss")
-                plt.title("Learning Curve")
-                plt.legend()
-                plt.grid(True)
-                plt.tight_layout()
-                plt.savefig(f"training_curves/learning_curve_{start_run}.png", dpi=200)
-                break
-        if (epoch+1) % 5 == 0:
-            plt.figure(figsize=(8, 5))
-            plt.plot(train_losses[1:], label="Train Loss")
-            plt.plot(test_losses[1:], label="Test Loss")
-            plt.xlabel("Epoch")
-            plt.ylabel("Loss")
-            plt.title("Learning Curve")
-            plt.legend()
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig(f"training_curves/learning_curve_{start_run}.png", dpi=200)
-
-        torch.cuda.empty_cache()
+            epochs_without_improvement += 1
+        
+        # Early stopping
+        if epochs_without_improvement >= early_stop_patience:
+            print(f"\nEarly stopping triggered after {epoch+1} epochs")
+            break
+        
+        # Save curve every 5 epochs
+        if (epoch + 1) % 5 == 0:
+            save_training_curve(train_losses, val_losses, curve_path)
+    
+    # Final save
+    save_training_curve(train_losses, val_losses, curve_path)
+    
+    print("\n" + "=" * 70)
+    print("Training complete!")
+    print(f"Best validation loss: {best_val_loss:.6f}")
+    print(f"Model saved: {model_path}")
+    print(f"Training curve: {curve_path}")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

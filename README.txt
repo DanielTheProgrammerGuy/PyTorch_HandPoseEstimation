@@ -80,6 +80,80 @@ with torch.no_grad():
 
 Fingertips are the most challenging due to their small size and high variability.
 
+##Detailed result Breakdown (output from Accuracy_Calculation)
+
+======================================================================
+RESULTS - Method 1: Softmax Coordinates
+======================================================================
+PCK@0.2: 96.74%
+Mean Error: 2.91 pixels
+
+Per-Keypoint PCK@0.2:
+  Wrist       :  99.1%
+  Thumb1      :  98.2%
+  Thumb2      :  97.7%
+  Thumb3      :  96.4%
+  Thumb4      :  90.8%
+  Index1      :  98.3%
+  Index2      :  97.5%
+  Index3      :  96.6%
+  Index4      :  92.1%
+  Middle1     :  99.4%
+  Middle2     :  98.9%
+  Middle3     :  97.7%
+  Middle4     :  94.1%
+  Ring1       :  98.6%
+  Ring2       :  98.7%
+  Ring3       :  97.7%
+  Ring4       :  94.0%
+  Pinky1      :  98.1%
+  Pinky2      :  97.9%
+  Pinky3      :  96.7%
+  Pinky4      :  93.1%
+
+Best keypoint:  99.4%
+Worst keypoint: 90.8%
+
+======================================================================
+RESULTS - Method 2: Weighted Local Peak
+======================================================================
+PCK@0.2: 96.46%
+Mean Error: 2.99 pixels
+
+Per-Keypoint PCK@0.2:
+  Wrist       :  98.7%
+  Thumb1      :  97.8%
+  Thumb2      :  97.5%
+  Thumb3      :  96.0%
+  Thumb4      :  90.6%
+  Index1      :  98.6%
+  Index2      :  97.2%
+  Index3      :  95.9%
+  Index4      :  91.8%
+  Middle1     :  99.2%
+  Middle2     :  98.4%
+  Middle3     :  97.3%
+  Middle4     :  93.4%
+  Ring1       :  98.6%
+  Ring2       :  98.7%
+  Ring3       :  97.2%
+  Ring4       :  93.4%
+  Pinky1      :  98.1%
+  Pinky2      :  97.7%
+  Pinky3      :  96.5%
+  Pinky4      :  93.1%
+
+Best keypoint:  99.2%
+Worst keypoint: 90.6%
+
+======================================================================
+SUMMARY
+======================================================================
+Best method: Softmax
+Best PCK@0.2: 96.74%
+Best Mean Error: 2.91 pixels
+======================================================================
+
 ## Technical Details
 
 - **Framework**: PyTorch
@@ -90,11 +164,13 @@ Fingertips are the most challenging due to their small size and high variability
 
 ## Files
 
-- `train.py` - Training script
-- `test.py` - Evaluation script
-- `model.py` - U-Net architecture definition
+- `Training.py` - Training script and model definition
+- `Testing_Validation.py` - Evaluation of Validation Visualisation script
+- `Testing_Camera.py` - Evaluation of Camera Feed Visualisation script
+- `Accuracy_Calculation.py` - Accuracy PCK calculations
 - `Data_Extraction.py` - Data preprocessing utilities
-- `Training.py` - Training loop and loss functions
+- `utils.py` - Coordinates from heatmaps functions
+- `Config.py` - Configurable Parameters
 
 ## Citation
 

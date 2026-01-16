@@ -1,37 +1,17 @@
+"""
+Real-time hand pose estimation from webcam
+"""
+import os
 import cv2
 import torch
 import numpy as np
+
 from Training import UNet2DHandPose
-import os
-from skimage.feature import peak_local_max
+from utils import softmax_coords, weighted_local_peak_coords, max_peak_coords
 
 
-def softmax(heatmap):
-    coordinates = np.append(
-        np.sum(heatmap * np.indices(heatmap.shape)[1], axis=(1, 2)) / np.sum(heatmap, axis=(1, 2))[np.newaxis, :],
-        np.sum(heatmap * np.indices(heatmap.shape)[2], axis=(1, 2)) / np.sum(heatmap, axis=(1, 2))[np.newaxis, :]
-        , axis=0)
-    return coordinates
-
-def weighted_local_peak(heatmap):
-    softmax_coords = softmax(heatmap)
-    coordinates = []
-    for i in range(len(softmax_coords.T)):
-        local_peaks = peak_local_max(heatmap[i])
-        min_distance_index = np.argmin(np.sum(np.pow(local_peaks - softmax_coords.T[i],2),axis=-1))
-        coordinates.append(local_peaks[min_distance_index])
-    return np.array(coordinates).T
-
-def max_peak(heatmap):
-    coordinates = []
-    for j in range(heatmap.shape[0]):
-        max_temp_flat = np.argmax(heatmap[j])
-        row, col = np.unravel_index(max_temp_flat, heatmap[j].shape)
-        coordinates.append((row, col))
-    return np.array(coordinates).T
-
-# Define skeleton drawing
-chains = [
+# Hand skeleton structure
+SKELETON_CHAINS = [
     [0, 1, 2, 3, 4],      # Thumb
     [0, 5, 6, 7, 8],      # Index
     [0, 9, 10, 11, 12],   # Middle
@@ -39,119 +19,175 @@ chains = [
     [0, 17, 18, 19, 20],  # Pinky
 ]
 
-alpha = 0.5
+# Smoothing parameter
+SMOOTHING_ALPHA = 0.5
 
-def draw_skeleton(frame, coords, color, label):
-    for chain in chains:
-        cv2.polylines(frame, [np.array([(int(coords[1, j]), int(coords[0, j])) for j in chain])], False, color, 4)
 
-# Load model
-model = UNet2DHandPose()
-for i in range(len(os.listdir("models/"))):
-    print(f"{i}. {os.listdir('models/')[i]}")
-model_name = os.listdir('models/')[int(input("Enter model index: "))]
-model.load_state_dict(torch.load(f"models/{model_name}",map_location=torch.device('cpu')))
-model.eval()
+def draw_skeleton(frame, coords, color):
+    """
+    Draw hand skeleton on frame
+    
+    Args:
+        frame: Image frame
+        coords: Coordinates [2, 21] (row, col)
+        color: RGB color tuple
+    """
+    # Draw lines
+    for chain in SKELETON_CHAINS:
+        points = np.array([
+            (int(coords[1, j]), int(coords[0, j]))
+            for j in chain
+        ])
+        cv2.polylines(frame, [points], False, color, 4)
+    
+    # Draw joints
+    for j in range(coords.shape[1]):
+        x, y = int(coords[1, j]), int(coords[0, j])
+        cv2.circle(frame, (x, y), 6, color, -1)
 
-# Open webcam (0 = default)
-try:
-    cap = cv2.VideoCapture(1)
-except:
+
+def main():
+    """Main webcam inference loop"""
+    print("=" * 70)
+    print(" " * 15 + "Real-Time Hand Pose Estimation")
+    print("=" * 70)
+    
+    # Select model
+    models_dir = "models/"
+    models = os.listdir(models_dir)
+    
+    print("\nAvailable models:")
+    for i, model_name in enumerate(models):
+        print(f"  {i}. {model_name}")
+    
+    model_idx = int(input("\nEnter model index: "))
+    model_path = os.path.join(models_dir, models[model_idx])
+    
+    # Load model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = UNet2DHandPose().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    print(f"\nLoaded model: {models[model_idx]}")
+    print(f"Device: {device}")
+    
+    # Open webcam
+    print("\nOpening webcam...")
     cap = cv2.VideoCapture(0)
-
-# Get original frame dimensions
-ret, frame = cap.read()
-if not ret:
-    raise RuntimeError("Failed to read from camera.")
-h, w, _ = frame.shape
-print(f"Camera feed size: {w}x{h}")
-
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter('output.mp4', fourcc, 20.0, (w, h))
-
-# Define center crop box
-crop_size = h
-center_x, center_y = w // 2, h // 2
-half = crop_size // 2
-
-while True:
+    
+    if not cap.isOpened():
+        print("Error: Could not open webcam")
+        return
+    
+    # Get frame dimensions
     ret, frame = cap.read()
     if not ret:
-        break
+        print("Error: Could not read frame")
+        return
+    
+    h, w, _ = frame.shape
+    print(f"Camera resolution: {w}x{h}")
+    
+    # Video writer (optional)
+    save_video = input("\nSave video output? (y/n): ").lower() == 'y'
+    if save_video:
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter('output.mp4', fourcc, 20.0, (w, h))
+    
+    # Crop parameters (center square)
+    crop_size = min(h, w)
+    center_x, center_y = w // 2, h // 2
+    half_crop = crop_size // 2
+    
+    # For temporal smoothing
+    smoothed_coords = None
+    
+    print("\n" + "=" * 70)
+    print("Starting inference... Press 'q' to quit")
+    print("=" * 70)
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Crop center region
+            top = max(center_y - half_crop, 0)
+            left = max(center_x - half_crop, 0)
+            bottom = min(center_y + half_crop, h)
+            right = min(center_x + half_crop, w)
+            cropped = frame[top:bottom, left:right]
+            
+            # Resize for model input
+            resized = cv2.resize(cropped, (128, 128))
+            
+            # Normalize and prepare tensor
+            input_tensor = torch.from_numpy(resized).permute(2, 0, 1)
+            input_tensor = input_tensor.unsqueeze(0).float() / 255.0
+            input_tensor = input_tensor.to(device)
+            
+            # Forward pass
+            with torch.no_grad():
+                output = model(input_tensor)[0].cpu().numpy()
+            
+            # Remove low confidence
+            for k in range(len(output)):
+                threshold = np.max(output[k]) * 0.4
+                output[k][output[k] < threshold] = 0
+            
+            # Extract coordinates
+            scale = crop_size / output.shape[-1]
+            coords = weighted_local_peak_coords(output, scale=1.0)[::-1]
+            
+            # Temporal smoothing
+            if smoothed_coords is None:
+                smoothed_coords = coords.copy()
+            else:
+                smoothed_coords = (
+                    SMOOTHING_ALPHA * smoothed_coords +
+                    (1 - SMOOTHING_ALPHA) * coords
+                )
+            
+            # Scale to cropped frame
+            x_proj = (smoothed_coords[1] * scale).astype(int)
+            y_proj = (smoothed_coords[0] * scale).astype(int)
+            
+            # Draw skeleton
+            display_frame = cropped.copy()
+            draw_skeleton(
+                display_frame,
+                np.vstack((y_proj, x_proj)),
+                (0, 255, 0)  # Green
+            )
+            
+            # Show frame
+            cv2.imshow("Hand Pose Estimation (Press 'q' to quit)", display_frame)
+            
+            # Save to video
+            if save_video:
+                # Pad to original size
+                padded = np.zeros((h, w, 3), dtype=np.uint8)
+                padded[top:bottom, left:right] = display_frame
+                out.write(padded)
+            
+            # Check for quit
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    
+    finally:
+        # Cleanup
+        cap.release()
+        if save_video:
+            out.release()
+        cv2.destroyAllWindows()
+        
+        print("\n" + "=" * 70)
+        print("Inference stopped")
+        if save_video:
+            print("Video saved: output.mp4")
+        print("=" * 70)
 
-    # --- Crop the center 512×512 region ---
-    top = max(center_y - half, 0)
-    left = max(center_x - half, 0)
-    bottom = min(center_y + half, h)
-    right = min(center_x + half, w)
-    cropped = frame[top:bottom, left:right]
-    # --- Resize to 128×128 for model input ---
-    resized = cv2.resize(cropped, (128, 128), interpolation=cv2.INTER_AREA)
-    resized_view = cv2.resize(cropped, (bottom-top, bottom-top), interpolation=cv2.INTER_AREA)
 
-    frame = cropped
-    left, top, right, bottom = 0, 0, 0, 0
-
-    # --- Normalize + move channels for model ---
-    input_tensor = torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-
-    with torch.no_grad():
-        output = model(input_tensor)[0].numpy()
-
-    for k in range(len(output)):
-        output[k][output[k]<np.max(output[k])*0.4] = 0
-
-    # --- Compute estimated joint coordinates (64×64 heatmaps) ---
-    indices = np.indices(output.shape)
-    estimated_coordinates_1 = weighted_local_peak(output)[::-1]
-    estimated_coordinates_2 = softmax(output)[::-1]
-    estimated_coordinates_3 = max_peak(output)[::-1]
-
-    # Convert from heatmap (64×64) → cropped (512×512) → full frame
-    scale_factor = crop_size / output.shape[-1]  # 8.0
-
-    if 'smoothed_coords' not in globals():
-        smoothed_coords = estimated_coordinates_1.copy()
-
-    smoothed_coords = alpha * smoothed_coords + (1 - alpha) * estimated_coordinates_1
-
-    x_coords_1, y_coords_1 = smoothed_coords
-    x_proj_1 = (x_coords_1 * scale_factor + left).astype(int)
-    y_proj_1 = (y_coords_1 * scale_factor + top).astype(int)
-
-    x_coords_2, y_coords_2 = estimated_coordinates_2
-    x_proj_2 = (x_coords_2 * scale_factor + left).astype(int)
-    y_proj_2 = (y_coords_2 * scale_factor + top).astype(int)
-
-    x_coords_3, y_coords_3 = estimated_coordinates_3
-    x_proj_3 = (x_coords_3 * scale_factor + left).astype(int)
-    y_proj_3 = (y_coords_3 * scale_factor + top).astype(int)
-
-    frame1 = resized_view.copy()
-    frame2 = resized_view.copy()
-    frame3 = resized_view.copy()
-
-    # --- Draw points ---
-    for (x, y) in zip(x_proj_1, y_proj_1):
-        cv2.circle(frame1, (x, y), 10, (255, 0, 0), -1)
-    for (x, y) in zip(x_proj_2, y_proj_2):
-        cv2.circle(frame2, (x, y), 10, (255, 0, 0), -1)
-    for (x, y) in zip(x_proj_3, y_proj_3):
-        cv2.circle(frame3, (x, y), 10, (255, 0, 0), -1)
-
-    # --- Draw lines ---
-    draw_skeleton(frame1, np.vstack((y_proj_1, x_proj_1)), (100, 0, 0), "Estimated Pose")
-    draw_skeleton(frame2, np.vstack((y_proj_2, x_proj_2)), (100, 0, 0), "Smoothed Pose")
-    draw_skeleton(frame3, np.vstack((y_proj_3, x_proj_3)), (100, 0, 0), "Max Peak Pose")
-
-    combined_frame = np.append(frame1, frame2, axis=0)
-    combined_frame = np.append(combined_frame, frame3, axis=0)
-
-    cv2.imshow("Hand Pose Estimation", combined_frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-    out.write(combined_frame)
-
-out.release()
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
