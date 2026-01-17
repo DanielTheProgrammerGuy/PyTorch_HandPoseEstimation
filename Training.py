@@ -309,6 +309,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, use_amp):
         scaler.update()
         
         total_loss += loss.item()
+        print(f"Batch {batch_idx + 1}/{len(loader)}: Loss = {total_loss/(batch_idx+1):.4f}\r")
 
     return total_loss / len(loader)
 
@@ -412,17 +413,17 @@ def main():
         train_dataset,
         batch_size=config["batch_size"],
         shuffle=True,
-        num_workers=4,
+        num_workers=0,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
+        persistent_workers=False,
+        prefetch_factor=None
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config["batch_size"],
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=True
     )
     
@@ -447,7 +448,6 @@ def main():
         mode='min',
         factor=0.1,
         patience=4,
-        verbose=True
     )
     scaler = GradScaler()
     

@@ -141,7 +141,7 @@ def main():
     # Generate visualizations
     visualize_predictions(
         model, image_data, heatmap_data,
-        775, num_samples, device
+        start_idx, num_samples, device
     )
 
     print("\n" + "=" * 70)

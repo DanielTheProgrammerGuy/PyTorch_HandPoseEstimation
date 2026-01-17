@@ -157,7 +157,7 @@ def main():
             display_frame = cropped.copy()
             draw_skeleton(
                 display_frame,
-                np.vstack((y_proj, x_proj)),
+                np.vstack((x_proj, y_proj)),
                 (0, 255, 0)  # Green
             )
             
