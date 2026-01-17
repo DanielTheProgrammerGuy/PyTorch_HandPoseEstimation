@@ -16,13 +16,18 @@ import torchvision.transforms.v2 as v2
 import torchvision.transforms.v2.functional as Fv2
 
 import numpy as np
+
 import cv2
+cv2.setNumThreads(0) 
+cv2.ocl.setUseOpenCL(False)
+
 import matplotlib.pyplot as plt
 
 from Config import config
 
-# Enable cuDNN benchmarking for faster training
+# Enable cuDNN benchmarking and TF32 for faster training
 torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision('high')
 
 
 class ConvBlock(nn.Module):
@@ -184,6 +189,61 @@ class AdaptiveWingLoss(nn.Module):
         )
         
         return loss.mean()
+    
+
+def gpu_augment(images, heatmaps):
+    """
+    images:   [B, 3, H, W] CUDA
+    heatmaps: [B, 21, H, W] CUDA
+    """
+    B, _, H, W = images.shape
+    device = images.device
+
+    # ---- Random affine ----
+    angles = (torch.rand(B, device=device) * 2 - 1) * 25 * torch.pi / 180
+    scales = 1 + (torch.rand(B, device=device) * 2 - 1) * 0.2
+    tx = (torch.rand(B, device=device) * 2 - 1) * 0.15
+    ty = (torch.rand(B, device=device) * 2 - 1) * 0.15
+
+    theta = torch.zeros(B, 2, 3, device=device)
+    theta[:, 0, 0] = scales * torch.cos(angles)
+    theta[:, 0, 1] = -scales * torch.sin(angles)
+    theta[:, 1, 0] = scales * torch.sin(angles)
+    theta[:, 1, 1] = scales * torch.cos(angles)
+    theta[:, 0, 2] = tx
+    theta[:, 1, 2] = ty
+
+    grid = F.affine_grid(theta, images.size(), align_corners=False)
+
+    images = F.grid_sample(
+        images, grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=False
+    )
+
+    heatmaps = F.grid_sample(
+        heatmaps, grid,
+        mode="nearest",
+        padding_mode="zeros",
+        align_corners=False
+    )
+
+    # ---- Horizontal flip ----
+    flip = torch.rand(B, device=device) < 0.5
+    images[flip] = torch.flip(images[flip], dims=[3])
+    heatmaps[flip] = torch.flip(heatmaps[flip], dims=[3])
+
+    # ---- GPU Gaussian Blur ----
+    if torch.rand(1) < 0.5:
+        # Kernel size 5x5, sigma between 0.1 and 2.0
+        images = Fv2.gaussian_blur(images, kernel_size=[5, 5], sigma=[0.1, 2.0])
+
+    # ---- Color jitter (brightness only, cheap & effective) ----
+    brightness = 1.0 + 0.4 * (torch.rand(B, 1, 1, 1, device=device) - 0.5)
+    images = torch.clamp(images * brightness, 0, 1)
+
+    return images, heatmaps
 
 
 class AugmentedDataset(Dataset):
@@ -295,6 +355,8 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, use_amp):
     for batch_idx, (images, heatmaps) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         heatmaps = heatmaps.to(device, non_blocking=True)
+        images, heatmaps = gpu_augment(images, heatmaps)
+
 
         optimizer.zero_grad()
 
@@ -309,8 +371,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, use_amp):
         scaler.update()
         
         total_loss += loss.item()
-        print(f"Batch {batch_idx + 1}/{len(loader)}: Loss = {total_loss/(batch_idx+1):.4f}\r")
-
+        print(f"Batch {batch_idx + 1}/{len(loader)}: Loss = {total_loss/(batch_idx+1):.4f}",end="\r")
     return total_loss / len(loader)
 
 
@@ -405,7 +466,7 @@ def main():
     ])
     
     # Create datasets
-    train_dataset = AugmentedDataset(train_images, train_heatmaps, train_transforms)
+    train_dataset = AugmentedDataset(train_images, train_heatmaps, transform=None)
     val_dataset = AugmentedDataset(val_images, val_heatmaps, transform=None)
     
     # Create dataloaders
@@ -429,6 +490,7 @@ def main():
     
     # Initialize model
     model = UNet2DHandPose().to(device)
+    model = torch.compile(model, backend="cudagraphs")
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {total_params:,}")
     

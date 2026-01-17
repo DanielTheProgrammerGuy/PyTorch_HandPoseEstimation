@@ -98,9 +98,9 @@ def load_images(subfolder, max_images=32560):
         images.append(img)
         
         if (i + 1) % 1000 == 0:
-            print(f"Loaded {i + 1}/{max_images} images")
+            print(f"Loaded {i + 1}/{max_images} images ({(i+1)/max_images:.2%})",end = "\r")
     
-    print(f"Successfully loaded {len(images)} images")
+    print(f"\nSuccessfully loaded {len(images)} images")
     return np.array(images, dtype=np.float32), original_size
 
 
@@ -176,9 +176,9 @@ def generate_heatmaps(x_coords, y_coords):
             )
         
         if (i + 1) % 1000 == 0:
-            print(f"Generated heatmaps for {i + 1}/{n_samples} samples")
+            print(f"Generated heatmaps for {i + 1}/{n_samples} samples ({(i+1)/n_samples:.2%})", end = "\r")
     
-    print(f"Successfully generated heatmaps for {n_samples} samples")
+    print(f"\nSuccessfully generated heatmaps for {n_samples} samples")
     return heatmaps
 
 
